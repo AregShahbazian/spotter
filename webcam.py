@@ -4,6 +4,7 @@ import os
 import sys
 import json
 import time
+from datetime import datetime
 import numpy as np
 import cv2
 
@@ -13,10 +14,15 @@ YUNET_MODEL = os.path.join(MODEL_DIR, "face_detection_yunet_2023mar.onnx")
 SFACE_MODEL = os.path.join(MODEL_DIR, "face_recognition_sface_2021dec.onnx")
 FACES_DB_FILE = "faces_db.json"
 DEFAULT_THRESHOLD = 60
-COSINE_THRESHOLD = 0.363  # SFace recommended threshold
+COSINE_THRESHOLD = 0.40   # raised from 0.363 to reduce false matches
 WINDOW_NAME = "Webcam Viewer"
 MAX_EMBEDDINGS = 20
 EMBEDDING_INTERVAL = 2.0  # seconds between storing embeddings for a known face
+PANEL_WIDTH = 300
+PANEL_BG = (30, 30, 30)
+PANEL_HEADER_H = 35
+ROW_HEIGHT = 28
+SIGHTING_ROW_H = 20
 
 NAMES = [
     "Atlas", "Nova", "Echo", "Sage", "Orion",
@@ -46,6 +52,9 @@ class FaceDB:
                 data = json.load(f)
             self.faces = data.get("faces", [])
             self.next_name_idx = data.get("next_name_idx", 0)
+            for face in self.faces:
+                if "sightings" not in face:
+                    face["sightings"] = []
         self._rebuild_cache()
 
     def _rebuild_cache(self):
@@ -75,22 +84,35 @@ class FaceDB:
         self.save_force()
 
     def find_match(self, recognizer, embedding):
-        best_score = -1
-        best_idx = -1
+        scores = []
         for i, avg in self._avg_cache.items():
             score = recognizer.match(embedding, avg, cv2.FaceRecognizerSF_FR_COSINE)
-            if score > best_score:
-                best_score = score
-                best_idx = i
-        if best_score >= COSINE_THRESHOLD:
-            return best_idx, best_score
-        return -1, best_score
+            scores.append((score, i))
+        if not scores:
+            return -1, -1
+        scores.sort(reverse=True)
+        best_score, best_idx = scores[0]
+        if best_score < COSINE_THRESHOLD:
+            return -1, best_score
+        # Ambiguity rejection: if second-best is too close, refuse match
+        if len(scores) > 1:
+            second_score = scores[1][0]
+            if best_score - second_score < MATCH_MARGIN:
+                return -1, best_score
+        return best_idx, best_score
 
-    def add_embedding(self, face_idx, embedding):
+    def add_embedding(self, face_idx, embedding, recognizer=None):
         now = time.monotonic()
         last = self._last_embed_time.get(face_idx, 0)
         if now - last < EMBEDDING_INTERVAL:
             return
+        # Quality gate: reject embeddings too dissimilar from existing average
+        if recognizer is not None and face_idx in self._avg_cache:
+            emb_flat = embedding.reshape(1, -1)
+            sim = recognizer.match(emb_flat, self._avg_cache[face_idx],
+                                   cv2.FaceRecognizerSF_FR_COSINE)
+            if sim < TRACK_VERIFY_THRESHOLD:
+                return
         self._last_embed_time[face_idx] = now
 
         emb_list = self.faces[face_idx]["embeddings"]
@@ -107,6 +129,7 @@ class FaceDB:
         self.faces.append({
             "name": name,
             "embeddings": [embedding.flatten().tolist()],
+            "sightings": [],
         })
         idx = len(self.faces) - 1
         self._avg_cache[idx] = embedding.reshape(1, -1).copy()
@@ -114,6 +137,21 @@ class FaceDB:
         self._dirty = True
         self.save_force()
         return name
+
+    def add_sighting(self, name, start_dt, end_dt):
+        """Record a completed sighting for the given person."""
+        duration = (end_dt - start_dt).total_seconds()
+        if duration < 0.5:
+            return
+        for face in self.faces:
+            if face["name"] == name:
+                face["sightings"].append({
+                    "start": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "end": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "duration_sec": round(duration, 1),
+                })
+                self._dirty = True
+                return
 
     def _next_name(self):
         idx = self.next_name_idx
@@ -125,19 +163,41 @@ class FaceDB:
 
 
 IOU_THRESHOLD = 0.3
-PENDING_FRAMES = 10  # frames before registering a new face (~0.3s at 30fps)
+PENDING_FRAMES = 20  # frames before registering a new face (~0.7s at 30fps)
+TRACK_VERIFY_THRESHOLD = 0.25  # embedding sanity check after IoU match
+RECOVERY_THRESHOLD = 0.35      # re-link lost tracks by embedding
+MATCH_MARGIN = 0.05            # reject ambiguous DB matches
+MIN_FACE_SIZE = 60             # skip tiny/partial faces (pixels)
 STALE_FRAMES = 15  # remove tracks not seen for this many frames
 
 
 class FaceTracker:
     """Frame-to-frame face tracker using bounding box IoU."""
 
-    def __init__(self):
-        self.tracks = {}  # track_id -> dict with keys: name, bbox, embedding, frames_seen, confirmed, pending_embeddings
+    def __init__(self, db):
+        self.tracks = {}
         self._next_id = 0
+        self._db = db
 
     def clear(self):
+        """Clear all tracks without recording sightings (used on DB clear)."""
         self.tracks.clear()
+
+    def finalize_all(self):
+        """End all active confirmed tracks and record their sightings."""
+        now = datetime.now()
+        for t in self.tracks.values():
+            if t["confirmed"] and t.get("start_time"):
+                self._db.add_sighting(t["name"], t["start_time"], now)
+
+    def get_active_names(self):
+        """Return set of names currently being tracked (confirmed only)."""
+        return {t["name"] for t in self.tracks.values() if t["confirmed"]}
+
+    def get_active_start_times(self):
+        """Return dict of {name: start_time} for active confirmed tracks."""
+        return {t["name"]: t["start_time"] for t in self.tracks.values()
+                if t["confirmed"] and t.get("start_time")}
 
     def update(self, detections, frame, recognizer, db):
         """Match detections to tracks, return list of (bbox, name) for drawing."""
@@ -150,6 +210,8 @@ class FaceTracker:
         det_list = []  # list of (face_array, bbox_tuple)
         for face in detections:
             x1, y1, fw, fh = face[:4].astype(int)
+            if fw < MIN_FACE_SIZE or fh < MIN_FACE_SIZE:
+                continue
             det_list.append((face, (x1, y1, x1 + fw, y1 + fh)))
 
         if not det_list:
@@ -160,6 +222,8 @@ class FaceTracker:
         track_ids = list(self.tracks.keys())
         matched_det = set()
         matched_trk = set()
+        # Cache embeddings computed during matching for reuse later
+        det_embeddings = {}
 
         if track_ids:
             track_bboxes = [self.tracks[tid]["bbox"] for tid in track_ids]
@@ -175,58 +239,117 @@ class FaceTracker:
             for iou, di, ti in iou_pairs:
                 if di in matched_det or ti in matched_trk:
                     continue
-                matched_det.add(di)
-                matched_trk.add(ti)
                 tid = track_ids[ti]
                 track = self.tracks[tid]
                 face_arr, bbox = det_list[di]
+
+                # Compute embedding
+                aligned = recognizer.alignCrop(frame, face_arr)
+                embedding = recognizer.feature(aligned)
+                det_embeddings[di] = embedding
+
+                # Embedding verification for confirmed tracks
+                if track["confirmed"] and track["embedding"] is not None:
+                    sim = recognizer.match(embedding, track["embedding"],
+                                           cv2.FaceRecognizerSF_FR_COSINE)
+                    if sim < TRACK_VERIFY_THRESHOLD:
+                        # Different face in same position — reject IoU match
+                        continue
+
+                matched_det.add(di)
+                matched_trk.add(ti)
 
                 # Update track bbox
                 track["bbox"] = bbox
                 track["frames_seen"] += 1
                 track["missed"] = 0
-
-                # Recompute embedding for confirmed tracks (for add_embedding)
-                aligned = recognizer.alignCrop(frame, face_arr)
-                embedding = recognizer.feature(aligned)
                 track["embedding"] = embedding
 
                 if track["confirmed"]:
                     # Add embedding to DB for confirmed tracks
                     match_idx = self._find_db_idx(db, track["name"])
                     if match_idx >= 0:
-                        db.add_embedding(match_idx, embedding)
+                        db.add_embedding(match_idx, embedding, recognizer)
                     results.append((bbox, track["name"], face_arr[14]))
                 else:
                     # Pending track: accumulate embeddings
                     track["pending_embeddings"].append(embedding.copy())
                     if track["frames_seen"] >= PENDING_FRAMES:
-                        # Promote: compute average embedding and register
-                        avg_emb = np.mean(track["pending_embeddings"], axis=0).reshape(1, -1)
-                        # Re-check DB before registering (might have been registered by another track)
+                        # Promote with outlier-filtered averaging
+                        avg_emb = self._filtered_average(
+                            track["pending_embeddings"], recognizer)
+                        # Re-check DB before registering
                         match_idx, _ = db.find_match(recognizer, avg_emb)
                         if match_idx >= 0:
                             track["name"] = db.faces[match_idx]["name"]
-                            db.add_embedding(match_idx, avg_emb)
+                            db.add_embedding(match_idx, avg_emb, recognizer)
                         else:
                             track["name"] = db.register(avg_emb)
                             print(f"New face registered: {track['name']}")
                         track["confirmed"] = True
+                        track["start_time"] = datetime.now()
                         track["pending_embeddings"] = []
                     results.append((bbox, track["name"], face_arr[14]))
+
+        # Embedding-based track recovery: re-link unmatched detections
+        # to unmatched confirmed tracks that were recently lost
+        unmatched_det_ids = [di for di in range(len(det_list))
+                            if di not in matched_det]
+        unmatched_trk_ids = [ti for ti, tid in enumerate(track_ids)
+                             if ti not in matched_trk
+                             and self.tracks[tid]["confirmed"]
+                             and self.tracks[tid]["missed"] < 5]
+        if unmatched_det_ids and unmatched_trk_ids:
+            recovery_pairs = []
+            for di in unmatched_det_ids:
+                if di not in det_embeddings:
+                    face_arr, bbox = det_list[di]
+                    aligned = recognizer.alignCrop(frame, face_arr)
+                    det_embeddings[di] = recognizer.feature(aligned)
+                emb = det_embeddings[di]
+                for ti in unmatched_trk_ids:
+                    tid = track_ids[ti]
+                    track = self.tracks[tid]
+                    if track["embedding"] is not None:
+                        sim = recognizer.match(
+                            emb, track["embedding"],
+                            cv2.FaceRecognizerSF_FR_COSINE)
+                        if sim >= RECOVERY_THRESHOLD:
+                            recovery_pairs.append((sim, di, ti))
+            recovery_pairs.sort(reverse=True)
+            for sim, di, ti in recovery_pairs:
+                if di in matched_det or ti in matched_trk:
+                    continue
+                matched_det.add(di)
+                matched_trk.add(ti)
+                tid = track_ids[ti]
+                track = self.tracks[tid]
+                face_arr, bbox = det_list[di]
+                embedding = det_embeddings[di]
+                track["bbox"] = bbox
+                track["frames_seen"] += 1
+                track["missed"] = 0
+                track["embedding"] = embedding
+                match_idx = self._find_db_idx(db, track["name"])
+                if match_idx >= 0:
+                    db.add_embedding(match_idx, embedding, recognizer)
+                results.append((bbox, track["name"], face_arr[14]))
 
         # Unmatched detections: try DB match or create pending track
         for di, (face_arr, bbox) in enumerate(det_list):
             if di in matched_det:
                 continue
 
-            aligned = recognizer.alignCrop(frame, face_arr)
-            embedding = recognizer.feature(aligned)
+            if di in det_embeddings:
+                embedding = det_embeddings[di]
+            else:
+                aligned = recognizer.alignCrop(frame, face_arr)
+                embedding = recognizer.feature(aligned)
 
             match_idx, _ = db.find_match(recognizer, embedding)
             if match_idx >= 0:
                 name = db.faces[match_idx]["name"]
-                db.add_embedding(match_idx, embedding)
+                db.add_embedding(match_idx, embedding, recognizer)
                 # Create confirmed track
                 tid = self._new_id()
                 self.tracks[tid] = {
@@ -236,6 +359,7 @@ class FaceTracker:
                     "frames_seen": 1,
                     "missed": 0,
                     "confirmed": True,
+                    "start_time": datetime.now(),
                     "pending_embeddings": [],
                 }
                 results.append((bbox, name, face_arr[14]))
@@ -249,6 +373,7 @@ class FaceTracker:
                     "frames_seen": 1,
                     "missed": 0,
                     "confirmed": False,
+                    "start_time": None,
                     "pending_embeddings": [embedding.copy()],
                 }
                 results.append((bbox, "?", face_arr[14]))
@@ -258,9 +383,13 @@ class FaceTracker:
             if ti not in matched_trk:
                 self.tracks[tid]["missed"] += 1
 
-        # Remove stale tracks
+        # Remove stale tracks, record sightings for confirmed ones
         stale = [tid for tid, t in self.tracks.items() if t["missed"] > STALE_FRAMES]
+        now = datetime.now()
         for tid in stale:
+            t = self.tracks[tid]
+            if t["confirmed"] and t.get("start_time"):
+                self._db.add_sighting(t["name"], t["start_time"], now)
             del self.tracks[tid]
 
         return results
@@ -270,7 +399,11 @@ class FaceTracker:
         for t in self.tracks.values():
             t["missed"] += 1
         stale = [tid for tid, t in self.tracks.items() if t["missed"] > STALE_FRAMES]
+        now = datetime.now()
         for tid in stale:
+            t = self.tracks[tid]
+            if t["confirmed"] and t.get("start_time"):
+                self._db.add_sighting(t["name"], t["start_time"], now)
             del self.tracks[tid]
 
     def _find_db_idx(self, db, name):
@@ -285,6 +418,32 @@ class FaceTracker:
         return tid
 
     @staticmethod
+    def _filtered_average(embeddings, recognizer):
+        """Compute outlier-filtered average of pending embeddings."""
+        if len(embeddings) < 4:
+            return np.mean(embeddings, axis=0).reshape(1, -1)
+        # Compute pairwise cosine similarity matrix
+        n = len(embeddings)
+        sim_matrix = np.zeros((n, n), dtype=np.float32)
+        for i in range(n):
+            for j in range(i + 1, n):
+                ei = embeddings[i].reshape(1, -1)
+                ej = embeddings[j].reshape(1, -1)
+                s = recognizer.match(ei, ej, cv2.FaceRecognizerSF_FR_COSINE)
+                sim_matrix[i, j] = s
+                sim_matrix[j, i] = s
+            sim_matrix[i, i] = 1.0
+        # Average similarity of each embedding to all others
+        avg_sims = sim_matrix.mean(axis=1)
+        median_sim = np.median(avg_sims)
+        # Keep embeddings with above-median average similarity
+        keep = [i for i in range(n) if avg_sims[i] >= median_sim]
+        if len(keep) < 3:
+            keep = list(range(n))  # fallback to all
+        filtered = [embeddings[i] for i in keep]
+        return np.mean(filtered, axis=0).reshape(1, -1)
+
+    @staticmethod
     def _iou(a, b):
         """Compute IoU between two (x1, y1, x2, y2) bboxes."""
         x1 = max(a[0], b[0])
@@ -297,6 +456,20 @@ class FaceTracker:
         area_a = (a[2] - a[0]) * (a[3] - a[1])
         area_b = (b[2] - b[0]) * (b[3] - b[1])
         return inter / (area_a + area_b - inter)
+
+
+def format_duration(seconds):
+    """Format duration in seconds to a human-readable string."""
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    secs = seconds % 60
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s"
+    hours = minutes // 60
+    mins = minutes % 60
+    return f"{hours}h{mins:02d}m"
 
 
 def load_models():
@@ -316,7 +489,7 @@ def load_models():
 def main():
     detector, recognizer = load_models()
     db = FaceDB(FACES_DB_FILE)
-    tracker = FaceTracker()
+    tracker = FaceTracker(db)
     print(f"Loaded face database: {len(db.faces)} known face(s).")
 
     cap = cv2.VideoCapture(0)
@@ -330,9 +503,33 @@ def main():
     cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
     cv2.createTrackbar("Threshold %", WINDOW_NAME, DEFAULT_THRESHOLD, 100, lambda _: None)
 
+    # Panel UI state
+    expanded = set()          # face indices with expanded sighting list
+    panel_scroll = [0]        # scroll offset (mutable for callback)
+    frame_w = [640]           # current video width (mutable for callback)
+    panel_rows = []           # (y_start, y_end, face_idx or None) for click detection
+
+    def on_mouse(event, x, y, flags, _param):
+        if x < frame_w[0]:
+            return
+        panel_y = y
+        if event == cv2.EVENT_LBUTTONDOWN:
+            for ry1, ry2, fidx in panel_rows:
+                if fidx is not None and ry1 <= panel_y < ry2:
+                    expanded.symmetric_difference_update({fidx})
+                    break
+        elif event == cv2.EVENT_MOUSEWHEEL:
+            if flags > 0:
+                panel_scroll[0] = max(0, panel_scroll[0] - 30)
+            else:
+                panel_scroll[0] += 30
+
+    cv2.setMouseCallback(WINDOW_NAME, on_mouse)
+
     print("Webcam opened with face detection and recognition.")
     print("Press 'q' to quit, 'c' to clear the face database.")
     print("Use the slider to adjust the detection confidence threshold.")
+    print("Click person names in the side panel to view sighting history.")
 
     save_timer = time.monotonic()
 
@@ -343,6 +540,7 @@ def main():
             break
 
         h, w = frame.shape[:2]
+        frame_w[0] = w
         detector.setInputSize((w, h))
         threshold = cv2.getTrackbarPos("Threshold %", WINDOW_NAME)
 
@@ -373,7 +571,84 @@ def main():
         cv2.putText(frame, f"Threshold: {threshold}%  |  Known: {len(db.faces)}",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-        cv2.imshow(WINDOW_NAME, frame)
+        # --- Side panel ---
+        panel = np.full((h, PANEL_WIDTH, 3), PANEL_BG, dtype=np.uint8)
+        cv2.line(panel, (0, 0), (0, h), (80, 80, 80), 1)
+        cv2.putText(panel, "People", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.line(panel, (5, PANEL_HEADER_H), (PANEL_WIDTH - 5, PANEL_HEADER_H), (80, 80, 80), 1)
+
+        active_names = tracker.get_active_names()
+        active_starts = tracker.get_active_start_times()
+        new_rows = []
+        y = PANEL_HEADER_H + 5 - panel_scroll[0]
+
+        for fi, face in enumerate(db.faces):
+            name = face["name"]
+            sightings = face.get("sightings", [])
+            is_active = name in active_names
+            is_expanded = fi in expanded
+
+            if PANEL_HEADER_H < y < h:
+                # Expand/collapse triangle
+                tx, ty = 10, y + 10
+                if is_expanded:
+                    pts = np.array([[tx, ty], [tx + 10, ty], [tx + 5, ty + 8]], np.int32)
+                else:
+                    pts = np.array([[tx, ty], [tx + 8, ty + 5], [tx, ty + 10]], np.int32)
+                cv2.fillPoly(panel, [pts], (180, 180, 180))
+
+                # Name
+                name_color = (0, 255, 0) if is_active else (200, 200, 200)
+                cv2.putText(panel, name, (25, y + 18),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, name_color, 1)
+
+                # Status + count
+                n_sightings = len(sightings) + (1 if is_active else 0)
+                tag = f"LIVE ({n_sightings})" if is_active else f"({n_sightings})"
+                tag_color = (0, 255, 0) if is_active else (150, 150, 150)
+                cv2.putText(panel, tag, (PANEL_WIDTH - 100, y + 18),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, tag_color, 1)
+                new_rows.append((y, y + ROW_HEIGHT, fi))
+            y += ROW_HEIGHT
+
+            # Expanded: show sighting entries
+            if is_expanded:
+                # Show current live session first
+                if is_active and name in active_starts:
+                    if PANEL_HEADER_H < y < h:
+                        dur = (datetime.now() - active_starts[name]).total_seconds()
+                        line = f"  NOW  {format_duration(dur)}"
+                        cv2.putText(panel, line, (20, y + 14),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 200, 255), 1)
+                        new_rows.append((y, y + SIGHTING_ROW_H, None))
+                    y += SIGHTING_ROW_H
+
+                # Past sightings (most recent first, last 15)
+                for s in reversed(sightings[-15:]):
+                    if PANEL_HEADER_H < y < h:
+                        dur = format_duration(s["duration_sec"])
+                        try:
+                            dt = datetime.strptime(s["start"], "%Y-%m-%d %H:%M:%S")
+                            display = dt.strftime("%b %d %H:%M")
+                        except ValueError:
+                            display = s["start"][:16]
+                        line = f"  {display}  {dur}"
+                        cv2.putText(panel, line, (20, y + 14),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (140, 180, 140), 1)
+                        new_rows.append((y, y + SIGHTING_ROW_H, None))
+                    y += SIGHTING_ROW_H
+
+            # Separator
+            if PANEL_HEADER_H < y < h:
+                cv2.line(panel, (5, y), (PANEL_WIDTH - 5, y), (50, 50, 50), 1)
+            y += 3
+
+        panel_rows.clear()
+        panel_rows.extend(new_rows)
+
+        canvas = np.hstack([frame, panel])
+        cv2.imshow(WINDOW_NAME, canvas)
 
         now = time.monotonic()
         if now - save_timer > 10.0:
@@ -384,12 +659,15 @@ def main():
         if key == ord("q"):
             break
         if key == ord("c"):
-            db.clear()
             tracker.clear()
+            db.clear()
+            expanded.clear()
+            panel_scroll[0] = 0
             print("Face database cleared.")
         if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
             break
 
+    tracker.finalize_all()
     db.save_force()
     cap.release()
     cv2.destroyAllWindows()
