@@ -21,6 +21,11 @@ if ! "$VENV_DIR/bin/python" -c "import cv2" 2>/dev/null; then
     "$VENV_DIR/bin/pip" install opencv-python
 fi
 
+if ! "$VENV_DIR/bin/python" -c "from PIL import Image" 2>/dev/null; then
+    echo "Installing Pillow (for Russian language support)..."
+    "$VENV_DIR/bin/pip" install Pillow
+fi
+
 mkdir -p "$MODEL_DIR"
 
 if [ ! -f "$MODEL_DIR/face_detection_yunet_2023mar.onnx" ]; then

@@ -1,5 +1,18 @@
-.venv/
+# Build artifacts
+build/
+dist/
 __pycache__/
 *.pyc
-model/
+
+# Virtual environment
+.venv/
+
+# Runtime data
 faces_db.json
+thumbs/
+
+# Models (downloaded by run.sh / build script)
+model/
+
+# Generated icons
+assets/*.png

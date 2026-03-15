@@ -1,4 +1,4 @@
-"""Webcam Viewer — Phase 3: Live video feed with face detection and recognition."""
+"""Spotter — Live face detection, recognition, and tracking."""
 
 import os
 import sys
@@ -8,14 +8,30 @@ from datetime import datetime
 import numpy as np
 import cv2
 
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
 
-MODEL_DIR = "model"
+
+# When frozen (PyInstaller), assets are in the bundle; data goes to ~/.local/share/spotter
+if getattr(sys, "frozen", False):
+    _BUNDLE_DIR = sys._MEIPASS
+    _DATA_DIR = os.path.join(os.environ.get("XDG_DATA_HOME",
+                             os.path.expanduser("~/.local/share")), "spotter")
+    os.makedirs(_DATA_DIR, exist_ok=True)
+else:
+    _BUNDLE_DIR = os.path.dirname(os.path.abspath(__file__))
+    _DATA_DIR = _BUNDLE_DIR
+
+MODEL_DIR = os.path.join(_BUNDLE_DIR, "model")
 YUNET_MODEL = os.path.join(MODEL_DIR, "face_detection_yunet_2023mar.onnx")
 SFACE_MODEL = os.path.join(MODEL_DIR, "face_recognition_sface_2021dec.onnx")
-FACES_DB_FILE = "faces_db.json"
+FACES_DB_FILE = os.path.join(_DATA_DIR, "faces_db.json")
 DEFAULT_THRESHOLD = 60
 COSINE_THRESHOLD = 0.40   # raised from 0.363 to reduce false matches
-WINDOW_NAME = "Webcam Viewer"
+WINDOW_NAME = "Spotter"
 MAX_EMBEDDINGS = 20
 EMBEDDING_INTERVAL = 2.0  # seconds between storing embeddings for a known face
 PANEL_WIDTH = 300
@@ -23,6 +39,10 @@ PANEL_BG = (30, 30, 30)
 PANEL_HEADER_H = 35
 ROW_HEIGHT = 28
 SIGHTING_ROW_H = 20
+THUMB_DIR = os.path.join(_DATA_DIR, "thumbs")
+THUMB_SIZE = 60
+TOAST_WELCOME_SEC = 3.0
+TOAST_EVENT_SEC = 2.0
 
 NAMES = [
     "Atlas", "Nova", "Echo", "Sage", "Orion",
@@ -32,6 +52,101 @@ NAMES = [
     "Quinn", "Rune", "Sol", "Thorn", "Uma",
     "Vale", "Wren", "Xena", "Yara", "Zephyr",
 ]
+
+I18N = {
+    "en": {
+        "hud": "Threshold: {t}%  |  Known: {n}  |  EN",
+        "panel_header": "People",
+        "live": "LIVE ({c})",
+        "count": "({c})",
+        "now": "  NOW  {d}",
+        "welcome": "Welcome, {name}!",
+        "arrived": "{name} arrived",
+        "left": "{name} left",
+        "db_cleared": "Face database cleared.",
+        "new_face": "New face registered: {name}",
+    },
+    "ru": {
+        "hud": "Порог: {t}%  |  Известно: {n}  |  RU",
+        "panel_header": "Люди",
+        "live": "ОНЛАЙН ({c})",
+        "count": "({c})",
+        "now": "  СЕЙЧАС  {d}",
+        "welcome": "Привет, {name}!",
+        "arrived": "{name} пришёл",
+        "left": "{name} ушёл",
+        "db_cleared": "База лиц очищена.",
+        "new_face": "Новое лицо: {name}",
+    },
+}
+
+_FONT_CACHE = {}
+
+
+def _get_font(size):
+    if size in _FONT_CACHE:
+        return _FONT_CACHE[size]
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+    ]
+    for p in font_paths:
+        if os.path.isfile(p):
+            font = ImageFont.truetype(p, size)
+            _FONT_CACHE[size] = font
+            return font
+    font = ImageFont.load_default()
+    _FONT_CACHE[size] = font
+    return font
+
+
+def draw_text(img, text, org, font_scale, color_bgr, thickness=1):
+    """Draw text with Unicode support. Falls back to cv2.putText for ASCII."""
+    if not _PIL_AVAILABLE or all(ord(c) <= 127 for c in text):
+        cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale, color_bgr, thickness)
+        return
+    pil_size = max(10, int(font_scale * 30))
+    font = _get_font(pil_size)
+    left, top, right, bottom = font.getbbox(text)
+    tw, th = right - left + 4, bottom - top + 4
+    txt_img = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(txt_img)
+    color_rgb = (color_bgr[2], color_bgr[1], color_bgr[0])
+    draw.text((-left + 2, -top + 2), text, font=font, fill=color_rgb)
+    txt_np = np.array(txt_img)
+    x, y = org[0], org[1] - (bottom - top)
+    ih, iw = img.shape[:2]
+    sx, sy = max(0, -x), max(0, -y)
+    dx, dy = max(0, x), max(0, y)
+    cw = min(tw - sx, iw - dx)
+    ch = min(th - sy, ih - dy)
+    if cw <= 0 or ch <= 0:
+        return
+    alpha = txt_np[sy:sy+ch, sx:sx+cw, 3:4].astype(np.float32) / 255.0
+    fg = txt_np[sy:sy+ch, sx:sx+cw, :3][:, :, ::-1].astype(np.float32)
+    bg = img[dy:dy+ch, dx:dx+cw].astype(np.float32)
+    img[dy:dy+ch, dx:dx+cw] = (bg * (1 - alpha) + fg * alpha).astype(np.uint8)
+
+
+def text_size(text, font_scale, thickness=1):
+    """Get (width, height) of text, supporting Unicode."""
+    if not _PIL_AVAILABLE or all(ord(c) <= 127 for c in text):
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX,
+                                      font_scale, thickness)
+        return tw, th
+    pil_size = max(10, int(font_scale * 30))
+    font = _get_font(pil_size)
+    left, top, right, bottom = font.getbbox(text)
+    return right - left, bottom - top
+
+
+def tr(lang, key, **kwargs):
+    return I18N[lang][key].format(**kwargs)
 
 
 class FaceDB:
@@ -44,7 +159,9 @@ class FaceDB:
         self._dirty = False
         self._avg_cache = {}
         self._last_embed_time = {}
+        self._thumb_cache = {}
         self._load()
+        self._load_thumbs()
 
     def _load(self):
         if os.path.isfile(self.path):
@@ -64,6 +181,33 @@ class FaceDB:
                 avg = np.array(face["embeddings"], dtype=np.float32).mean(axis=0).reshape(1, -1)
                 self._avg_cache[i] = avg
 
+    def _load_thumbs(self):
+        if not os.path.isdir(THUMB_DIR):
+            return
+        for face in self.faces:
+            name = face["name"]
+            path = os.path.join(THUMB_DIR, f"{name}.jpg")
+            if os.path.isfile(path):
+                img = cv2.imread(path)
+                if img is not None:
+                    self._thumb_cache[name] = img
+
+    def save_thumb(self, name, frame, bbox):
+        os.makedirs(THUMB_DIR, exist_ok=True)
+        x1, y1, x2, y2 = bbox
+        fh, fw = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(fw, x2), min(fh, y2)
+        if x2 <= x1 or y2 <= y1:
+            return
+        crop = frame[y1:y2, x1:x2]
+        thumb = cv2.resize(crop, (THUMB_SIZE, THUMB_SIZE))
+        cv2.imwrite(os.path.join(THUMB_DIR, f"{name}.jpg"), thumb)
+        self._thumb_cache[name] = thumb
+
+    def get_thumb(self, name):
+        return self._thumb_cache.get(name)
+
     def save(self):
         if not self._dirty:
             return
@@ -81,6 +225,10 @@ class FaceDB:
         self.next_name_idx = 0
         self._avg_cache.clear()
         self._last_embed_time.clear()
+        self._thumb_cache.clear()
+        if os.path.isdir(THUMB_DIR):
+            for f in os.listdir(THUMB_DIR):
+                os.remove(os.path.join(THUMB_DIR, f))
         self.save_force()
 
     def find_match(self, recognizer, embedding):
@@ -178,6 +326,7 @@ class FaceTracker:
         self.tracks = {}
         self._next_id = 0
         self._db = db
+        self.events = []  # (type, name) — "new", "enter", "exit"
 
     def clear(self):
         """Clear all tracks without recording sightings (used on DB clear)."""
@@ -202,6 +351,7 @@ class FaceTracker:
     def update(self, detections, frame, recognizer, db):
         """Match detections to tracks, return list of (bbox, name) for drawing."""
         results = []
+        self.events.clear()
         if detections is None:
             # No faces: age all tracks
             self._age_tracks()
@@ -283,9 +433,13 @@ class FaceTracker:
                         if match_idx >= 0:
                             track["name"] = db.faces[match_idx]["name"]
                             db.add_embedding(match_idx, avg_emb, recognizer)
+                            self.events.append(("enter", track["name"]))
+                            db.save_thumb(track["name"], frame, bbox)
                         else:
                             track["name"] = db.register(avg_emb)
                             print(f"New face registered: {track['name']}")
+                            self.events.append(("new", track["name"]))
+                            db.save_thumb(track["name"], frame, bbox)
                         track["confirmed"] = True
                         track["start_time"] = datetime.now()
                         track["pending_embeddings"] = []
@@ -350,6 +504,8 @@ class FaceTracker:
             if match_idx >= 0:
                 name = db.faces[match_idx]["name"]
                 db.add_embedding(match_idx, embedding, recognizer)
+                self.events.append(("enter", name))
+                db.save_thumb(name, frame, bbox)
                 # Create confirmed track
                 tid = self._new_id()
                 self.tracks[tid] = {
@@ -390,6 +546,7 @@ class FaceTracker:
             t = self.tracks[tid]
             if t["confirmed"] and t.get("start_time"):
                 self._db.add_sighting(t["name"], t["start_time"], now)
+                self.events.append(("exit", t["name"]))
             del self.tracks[tid]
 
         return results
@@ -404,6 +561,7 @@ class FaceTracker:
             t = self.tracks[tid]
             if t["confirmed"] and t.get("start_time"):
                 self._db.add_sighting(t["name"], t["start_time"], now)
+                self.events.append(("exit", t["name"]))
             del self.tracks[tid]
 
     def _find_db_idx(self, db, name):
@@ -527,11 +685,13 @@ def main():
     cv2.setMouseCallback(WINDOW_NAME, on_mouse)
 
     print("Webcam opened with face detection and recognition.")
-    print("Press 'q' to quit, 'c' to clear the face database.")
+    print("Press 'q' to quit, 'c' to clear, 'l' to switch language (EN/RU).")
     print("Use the slider to adjust the detection confidence threshold.")
     print("Click person names in the side panel to view sighting history.")
 
     save_timer = time.monotonic()
+    toasts = []  # (text, expire_time, color, font_scale)
+    lang = "en"
 
     while True:
         ret, frame = cap.read()
@@ -556,6 +716,20 @@ def main():
         # Run tracker
         tracked_faces = tracker.update(filtered, frame, recognizer, db)
 
+        # Process tracker events into toasts
+        now_mono = time.monotonic()
+        for evt_type, evt_name in tracker.events:
+            if evt_type == "new":
+                toasts.append((tr(lang, "welcome", name=evt_name),
+                               now_mono + TOAST_WELCOME_SEC, (0, 255, 255), 0.9))
+            elif evt_type == "enter":
+                toasts.append((tr(lang, "arrived", name=evt_name),
+                               now_mono + TOAST_EVENT_SEC, (0, 255, 0), 0.7))
+            elif evt_type == "exit":
+                toasts.append((tr(lang, "left", name=evt_name),
+                               now_mono + TOAST_EVENT_SEC, (0, 150, 255), 0.7))
+        toasts = [t for t in toasts if t[1] > now_mono]
+
         for bbox, name, confidence in tracked_faces:
             x1, y1, x2, y2 = bbox
             color = (0, 255, 255) if name == "?" else (0, 255, 0)
@@ -568,14 +742,22 @@ def main():
             cv2.putText(frame, label, (label_x, label_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        cv2.putText(frame, f"Threshold: {threshold}%  |  Known: {len(db.faces)}",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        hud_text = tr(lang, "hud", t=threshold, n=len(db.faces))
+        draw_text(frame, hud_text, (10, 25), 0.7, (255, 255, 255), 2)
+
+        # Render toasts (bottom of frame, stacked upward)
+        toast_y = h - 40
+        for ttext, _expire, tcolor, tscale in reversed(toasts):
+            tw, th = text_size(ttext, tscale, 2)
+            tx = (w - tw) // 2
+            draw_text(frame, ttext, (tx, toast_y), tscale, (0, 0, 0), 4)
+            draw_text(frame, ttext, (tx, toast_y), tscale, tcolor, 2)
+            toast_y -= th + 15
 
         # --- Side panel ---
         panel = np.full((h, PANEL_WIDTH, 3), PANEL_BG, dtype=np.uint8)
         cv2.line(panel, (0, 0), (0, h), (80, 80, 80), 1)
-        cv2.putText(panel, "People", (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        draw_text(panel, tr(lang, "panel_header"), (10, 25), 0.7, (255, 255, 255), 2)
         cv2.line(panel, (5, PANEL_HEADER_H), (PANEL_WIDTH - 5, PANEL_HEADER_H), (80, 80, 80), 1)
 
         active_names = tracker.get_active_names()
@@ -605,22 +787,31 @@ def main():
 
                 # Status + count
                 n_sightings = len(sightings) + (1 if is_active else 0)
-                tag = f"LIVE ({n_sightings})" if is_active else f"({n_sightings})"
+                tag_key = "live" if is_active else "count"
+                tag = tr(lang, tag_key, c=n_sightings)
                 tag_color = (0, 255, 0) if is_active else (150, 150, 150)
-                cv2.putText(panel, tag, (PANEL_WIDTH - 100, y + 18),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, tag_color, 1)
+                draw_text(panel, tag, (PANEL_WIDTH - 100, y + 18), 0.4, tag_color, 1)
                 new_rows.append((y, y + ROW_HEIGHT, fi))
             y += ROW_HEIGHT
 
-            # Expanded: show sighting entries
+            # Expanded: show thumbnail + sighting entries
             if is_expanded:
+                # Show thumbnail
+                thumb = db.get_thumb(name)
+                if thumb is not None:
+                    ty1 = y + 2
+                    ty2 = ty1 + THUMB_SIZE
+                    tx1, tx2 = 20, 20 + THUMB_SIZE
+                    if PANEL_HEADER_H < ty1 and ty2 < h:
+                        panel[ty1:ty2, tx1:tx2] = thumb
+                    y += THUMB_SIZE + 4
+
                 # Show current live session first
                 if is_active and name in active_starts:
                     if PANEL_HEADER_H < y < h:
                         dur = (datetime.now() - active_starts[name]).total_seconds()
-                        line = f"  NOW  {format_duration(dur)}"
-                        cv2.putText(panel, line, (20, y + 14),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 200, 255), 1)
+                        line = tr(lang, "now", d=format_duration(dur))
+                        draw_text(panel, line, (20, y + 14), 0.35, (0, 200, 255), 1)
                         new_rows.append((y, y + SIGHTING_ROW_H, None))
                     y += SIGHTING_ROW_H
 
@@ -658,12 +849,15 @@ def main():
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
+        if key == ord("l"):
+            lang = "ru" if lang == "en" else "en"
         if key == ord("c"):
             tracker.clear()
             db.clear()
             expanded.clear()
             panel_scroll[0] = 0
-            print("Face database cleared.")
+            toasts.clear()
+            print(tr(lang, "db_cleared"))
         if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
             break
 

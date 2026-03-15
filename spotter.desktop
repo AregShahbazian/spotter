@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Spotter
+Comment=Live face detection, recognition, and tracking
+Exec=/opt/spotter/spotter
+Icon=spotter
+Terminal=false
+Type=Application
+Categories=Utility;Video;
+Keywords=face;recognition;webcam;camera;detection;

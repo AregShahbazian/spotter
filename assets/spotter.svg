@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2a5298"/>
+      <stop offset="100%" stop-color="#1e3c72"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="20" fill="url(#bg)"/>
+  <!-- Face outline -->
+  <ellipse cx="64" cy="62" rx="28" ry="34" fill="none" stroke="#e0e0e0" stroke-width="3"/>
+  <!-- Left eye -->
+  <ellipse cx="54" cy="54" rx="6" ry="4" fill="none" stroke="#4fc3f7" stroke-width="2.5"/>
+  <circle cx="54" cy="54" r="2" fill="#4fc3f7"/>
+  <!-- Right eye -->
+  <ellipse cx="74" cy="54" rx="6" ry="4" fill="none" stroke="#4fc3f7" stroke-width="2.5"/>
+  <circle cx="74" cy="54" r="2" fill="#4fc3f7"/>
+  <!-- Detection bracket corners -->
+  <path d="M28 30 L28 22 L36 22" fill="none" stroke="#4caf50" stroke-width="3" stroke-linecap="round"/>
+  <path d="M100 22 L100 30" fill="none" stroke="#4caf50" stroke-width="3" stroke-linecap="round"/>
+  <path d="M92 22 L100 22" fill="none" stroke="#4caf50" stroke-width="3" stroke-linecap="round"/>
+  <path d="M28 94 L28 102 L36 102" fill="none" stroke="#4caf50" stroke-width="3" stroke-linecap="round"/>
+  <path d="M100 94 L100 102 L92 102" fill="none" stroke="#4caf50" stroke-width="3" stroke-linecap="round"/>
+  <!-- App name -->
+  <text x="64" y="118" text-anchor="middle" font-family="sans-serif" font-weight="bold" font-size="14" fill="#ffffff">SPOTTER</text>
+</svg>
