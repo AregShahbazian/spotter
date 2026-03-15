@@ -18,8 +18,12 @@ except ImportError:
 # When frozen (PyInstaller), assets are in the bundle; data goes to ~/.local/share/spotter
 if getattr(sys, "frozen", False):
     _BUNDLE_DIR = sys._MEIPASS
-    _DATA_DIR = os.path.join(os.environ.get("XDG_DATA_HOME",
-                             os.path.expanduser("~/.local/share")), "spotter")
+    if sys.platform == "win32":
+        _DATA_DIR = os.path.join(os.environ.get("APPDATA",
+                                 os.path.expanduser("~")), "Spotter")
+    else:
+        _DATA_DIR = os.path.join(os.environ.get("XDG_DATA_HOME",
+                                 os.path.expanduser("~/.local/share")), "spotter")
     os.makedirs(_DATA_DIR, exist_ok=True)
 else:
     _BUNDLE_DIR = os.path.dirname(os.path.abspath(__file__))
