@@ -1,5 +1,8 @@
 # Spotter — PRD
 
+Design/requirements record, kept as the project evolved phase by phase.
+For a quick start see the [README](../README.md).
+
 ## Overview
 A desktop application that displays a live webcam feed, detects human faces in real-time, recognizes/identifies individual people across sessions, and provides a rich side-panel UI with sighting history, thumbnails, and toast notifications. Supports English and Russian languages.
 
@@ -70,7 +73,7 @@ Addresses identity confusion and flickering by adding multiple layers of verific
 - **Toast notifications:** On-screen overlay messages — "Welcome, {name}!" (3s), "{name} arrived" (2s), "{name} left" (2s). Centered at bottom with black outline.
 - **Language toggle (EN/RU):** Press `l` to cycle. All on-screen UI text translated. Cyrillic rendered via Pillow. Current language shown in HUD.
 
-### Phase 6 — Ubuntu Packaging 🔲
+### Phase 6 — Ubuntu Packaging ✅
 Package Spotter as a standalone `.deb` installer for Ubuntu 22.04+.
 
 - **Build tool:** PyInstaller bundles Python interpreter, OpenCV, Pillow, numpy, and all code into a self-contained folder. No system Python or pip needed on the target machine.
@@ -82,7 +85,7 @@ Package Spotter as a standalone `.deb` installer for Ubuntu 22.04+.
 - **Uninstall:** `sudo dpkg -r spotter` removes everything cleanly.
 - **Build script:** `build-ubuntu.sh` automates the full build → package pipeline on the developer's Ubuntu machine.
 
-### Phase 7 — Windows Packaging 🔲
+### Phase 7 — Windows Packaging ✅
 Package Spotter as a `.exe` installer for Windows 10/11.
 
 - **Build tool:** PyInstaller on a Windows environment (GitHub Actions CI with `windows-latest` runner).
@@ -111,22 +114,11 @@ Package Spotter as a `.exe` installer for Windows 10/11.
 | `model/` | YuNet and SFace ONNX model files |
 | `faces_db.json` | Persistent face database (dev mode, in working dir) |
 | `thumbs/` | Face thumbnail images (dev mode, in working dir) |
-| `PRD.md` | This document |
+| `docs/PRD.md` | This document |
+| `.github/workflows/build.yml` | CI: builds the `.deb` and Windows installer on `v*` tags |
 
 ## Requirements
 - Ubuntu 22.04+ or Windows 10/11
 - USB webcam (any resolution)
 - No GPU required
 - No Python installation required (bundled in package)
-
-## How to Run (Development)
-```bash
-./run.sh
-```
-
-## How to Install (Ubuntu)
-```bash
-./build-ubuntu.sh
-sudo dpkg -i dist/spotter_1.0.0_amd64.deb
-```
-Then search "Spotter" in Activities or run `spotter` from terminal.
